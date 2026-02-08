@@ -1,0 +1,314 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_NAME="claude-worktree"
+
+usage() {
+    cat <<EOF
+Usage: $SCRIPT_NAME -j <TICKET-ID> [-p <prompt>]
+       $SCRIPT_NAME -b <branch-name> [-p <prompt>]
+       $SCRIPT_NAME --list
+       $SCRIPT_NAME --cleanup [--dry-run]
+
+Create a worktree and launch Claude in plan mode.
+Must be run from within a git repository.
+
+Options:
+    -j <TICKET-ID>       Create worktree for Jira ticket (branch: username/ticket-id)
+    -b <branch-name>     Create worktree with custom branch name
+    -p <prompt>          Append additional context to the initial prompt
+    -h, --help           Show this help message
+
+Commands:
+    --list               List active ticket worktrees
+    --cleanup            Remove worktrees for merged branches
+    --cleanup --dry-run  Show what would be removed
+
+Examples:
+    $SCRIPT_NAME -j LOGSI-611
+    $SCRIPT_NAME -j LOGSI-611 -p "Focus on the API layer"
+    $SCRIPT_NAME -b my-feature-branch
+    $SCRIPT_NAME --cleanup --dry-run
+
+Note: Exactly one of -j or -b must be specified when creating a worktree.
+EOF
+}
+
+# Detect the default branch from origin
+detect_main_branch() {
+    local default_branch
+    default_branch=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
+
+    if [[ -n "$default_branch" ]]; then
+        echo "$default_branch"
+        return
+    fi
+
+    for branch in main prod master; do
+        if git rev-parse --verify "origin/$branch" &>/dev/null; then
+            echo "$branch"
+            return
+        fi
+    done
+
+    echo "error: Could not detect main branch" >&2
+    exit 1
+}
+
+# Get repo name and worktree directory (run from repo root)
+get_repo_info() {
+    local repo_root
+    repo_root=$(git rev-parse --show-toplevel 2>/dev/null)
+    if [[ -z "$repo_root" ]]; then
+        echo "error: Not in a git repository" >&2
+        exit 1
+    fi
+
+    REPO_NAME=$(basename "$repo_root")
+    REPO_ROOT="$repo_root"
+    WORKTREE_BASE="$(dirname "$repo_root")/${REPO_NAME}_worktrees"
+}
+
+# List active ticket worktrees
+list_worktrees() {
+    get_repo_info
+
+    if [[ ! -d "$WORKTREE_BASE" ]]; then
+        echo "No worktrees directory found at $WORKTREE_BASE"
+        return
+    fi
+
+    echo "Worktrees in $WORKTREE_BASE:"
+    echo ""
+
+    local count=0
+    for dir in "$WORKTREE_BASE"/*/; do
+        [[ -d "$dir" ]] || continue
+        local name=$(basename "$dir")
+        [[ "$name" =~ ^wt[0-9]+$ ]] && continue
+
+        local branch=""
+        if [[ -f "$dir/.git" ]]; then
+            branch=$(git -C "$dir" branch --show-current 2>/dev/null || echo "detached")
+        fi
+
+        printf "  %-20s %s\n" "$name" "$branch"
+        ((count++)) || true
+    done
+
+    if [[ $count -eq 0 ]]; then
+        echo "  (no worktrees found)"
+    fi
+}
+
+# Cleanup merged worktrees (run from repo root)
+cleanup_worktrees() {
+    local dry_run="${1:-false}"
+    get_repo_info
+
+    if [[ ! -d "$WORKTREE_BASE" ]]; then
+        echo "No worktrees directory found at $WORKTREE_BASE"
+        return
+    fi
+
+    local main_branch
+    main_branch=$(detect_main_branch)
+
+    git -C "$REPO_ROOT" fetch origin "$main_branch" --quiet
+
+    echo "Checking worktrees for merged branches..."
+    echo ""
+
+    local removed=0
+    for dir in "$WORKTREE_BASE"/*/; do
+        [[ -d "$dir" ]] || continue
+        local name=$(basename "$dir")
+        [[ "$name" =~ ^wt[0-9]+$ ]] && continue
+
+        local branch=""
+        if [[ -f "$dir/.git" ]]; then
+            branch=$(git -C "$dir" branch --show-current 2>/dev/null || echo "")
+        fi
+
+        if [[ -z "$branch" ]]; then
+            continue
+        fi
+
+        if git -C "$REPO_ROOT" branch --merged "origin/$main_branch" | grep -q "$branch"; then
+            if [[ "$dry_run" == "true" ]]; then
+                echo "  Would remove: $name (branch '$branch' merged into $main_branch)"
+            else
+                echo "  Removing: $name (branch '$branch' merged into $main_branch)"
+                git -C "$REPO_ROOT" worktree remove "$dir" --force 2>/dev/null || rm -rf "$dir"
+                git -C "$REPO_ROOT" branch -d "$branch" 2>/dev/null || true
+            fi
+            ((removed++)) || true
+        fi
+    done
+
+    echo ""
+    if [[ $removed -eq 0 ]]; then
+        echo "No merged worktrees to clean up."
+    elif [[ "$dry_run" == "true" ]]; then
+        echo "Would remove $removed worktree(s). Run without --dry-run to execute."
+    else
+        echo "Removed $removed worktree(s)."
+    fi
+}
+
+# Create worktree and launch Claude
+create_and_launch() {
+    local ticket="$1"
+    local branch_override="$2"
+    local extra_prompt="$3"
+
+    get_repo_info
+
+    local username
+    username=$(whoami)
+
+    local main_branch
+    main_branch=$(detect_main_branch)
+
+    local branch_name
+    local worktree_name
+    local prompt
+
+    if [[ -n "$ticket" ]]; then
+        local ticket_upper=$(echo "$ticket" | tr '[:lower:]' '[:upper:]')
+        local ticket_lower=$(echo "$ticket" | tr '[:upper:]' '[:lower:]')
+        branch_name="${username}/${ticket_lower}"
+        worktree_name="$ticket_upper"
+        prompt="Fetch Jira ticket $ticket_upper. If it is in Todo status, transition it to In Progress. Then use the EnterPlanMode tool to plan the implementation."
+    else
+        branch_name="$branch_override"
+        # Use last component of branch name for worktree dir
+        worktree_name=$(echo "$branch_name" | tr '/' '-')
+        prompt="Use the EnterPlanMode tool to plan the implementation."
+    fi
+
+    if [[ -n "$extra_prompt" ]]; then
+        prompt="$prompt $extra_prompt"
+    fi
+
+    local worktree_dir="${WORKTREE_BASE}/${worktree_name}"
+
+    mkdir -p "$WORKTREE_BASE"
+
+    if [[ -d "$worktree_dir" ]]; then
+        echo "Worktree already exists at $worktree_dir"
+        echo "Resuming Claude session..."
+        cd "$worktree_dir"
+        exec claude --continue
+    else
+        echo "Creating worktree..."
+        echo "  Main branch: $main_branch"
+        echo "  Branch name: $branch_name"
+        echo "  Location: $worktree_dir"
+        echo ""
+
+        git -C "$REPO_ROOT" fetch origin "$main_branch" --quiet
+        git -C "$REPO_ROOT" worktree add -b "$branch_name" "$worktree_dir" "origin/$main_branch"
+
+        # Symlink local settings if present (gitignored, so not in worktree)
+        if [[ -f "$REPO_ROOT/.claude/settings.local.json" ]]; then
+            mkdir -p "$worktree_dir/.claude"
+            ln -s "$REPO_ROOT/.claude/settings.local.json" "$worktree_dir/.claude/settings.local.json"
+        fi
+
+        cd "$worktree_dir"
+        echo ""
+
+        echo "Launching Claude..."
+        exec claude "$prompt"
+    fi
+}
+
+# Check we're in a git repo
+require_git_repo() {
+    if ! git rev-parse --show-toplevel &>/dev/null; then
+        echo "error: Not in a git repository" >&2
+        exit 1
+    fi
+}
+
+# Main
+main() {
+    local ticket=""
+    local branch=""
+    local extra_prompt=""
+
+    if [[ $# -eq 0 ]]; then
+        usage
+        exit 1
+    fi
+
+    # Help doesn't require git repo
+    if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+        usage
+        exit 0
+    fi
+
+    # Everything else requires a git repo
+    require_git_repo
+
+    # Handle long options first
+    case "${1:-}" in
+        --list)
+            list_worktrees
+            exit 0
+            ;;
+        --cleanup)
+            local dry_run="false"
+            if [[ "${2:-}" == "--dry-run" ]]; then
+                dry_run="true"
+            fi
+            cleanup_worktrees "$dry_run"
+            exit 0
+            ;;
+    esac
+
+    # Parse short options
+    while getopts ":j:b:p:h" opt; do
+        case $opt in
+            j)
+                ticket="$OPTARG"
+                ;;
+            b)
+                branch="$OPTARG"
+                ;;
+            p)
+                extra_prompt="$OPTARG"
+                ;;
+            h)
+                usage
+                exit 0
+                ;;
+            \?)
+                echo "error: Invalid option: -$OPTARG" >&2
+                usage
+                exit 1
+                ;;
+            :)
+                echo "error: Option -$OPTARG requires an argument" >&2
+                usage
+                exit 1
+                ;;
+        esac
+    done
+
+    # Validate: exactly one of -j or -b required
+    if [[ -n "$ticket" && -n "$branch" ]]; then
+        echo "error: Cannot specify both -j and -b" >&2
+        exit 1
+    fi
+
+    if [[ -z "$ticket" && -z "$branch" ]]; then
+        echo "error: Must specify either -j <ticket> or -b <branch>" >&2
+        exit 1
+    fi
+
+    create_and_launch "$ticket" "$branch" "$extra_prompt"
+}
+
+main "$@"
